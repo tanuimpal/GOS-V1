@@ -1,0 +1,295 @@
+﻿GOS V1 — Billing Restricted-Read Contract
+Step 158.94.9UF
+
+=== ACCEPTED SQL CANDIDATE ===
+-- GOS V1 â€” LOCAL-ONLY RESTRICTED BILLING READ CANDIDATE
+-- NOT MIGRATION 0004. NOT APPROVED FOR PRODUCTION.
+-- Dependencies: existing migrations 0001 and 0002.
+-- Execute only after separate SQL review and isolated DB approval.
+
+BEGIN;
+
+-- Fail closed if either security role already exists.
+DO $roles$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname IN ('gos_billing_read_owner', 'gos_web_billing_read')
+  ) THEN
+    RAISE EXCEPTION 'Restricted billing-read role collision';
+  END IF;
+END
+$roles$;
+
+CREATE ROLE gos_billing_read_owner
+  NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+CREATE ROLE gos_web_billing_read
+  LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+-- No credentials are embedded or provisioned in this candidate.
+
+CREATE SCHEMA billing_api AUTHORIZATION CURRENT_USER;
+REVOKE ALL ON SCHEMA billing_api FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA billing_api TO gos_web_billing_read;
+
+-- Function owner receives no billing write permissions.
+GRANT USAGE ON SCHEMA public, gos_billing
+  TO gos_billing_read_owner;
+
+GRANT SELECT (
+  id, user_id, session_handle_hash,
+  active_organization_id, expires_at, revoked_at
+) ON public.auth_sessions TO gos_billing_read_owner;
+
+GRANT SELECT (id, status)
+  ON public.users TO gos_billing_read_owner;
+
+GRANT SELECT (id, name, status)
+  ON public.organizations TO gos_billing_read_owner;
+
+GRANT SELECT (
+  organization_id, user_id, role, status, accepted_at
+) ON public.memberships TO gos_billing_read_owner;
+
+GRANT SELECT (
+  id, organization_id, mode, price_id, status,
+  current_start, current_end, charge_at, paid_until,
+  refund_blocked_until, cancel_at_period_end,
+  cancel_state, create_state, last_synced_at, created_at
+) ON gos_billing.subscriptions TO gos_billing_read_owner;
+
+GRANT SELECT (id, plan_id, mode)
+  ON gos_billing.prices TO gos_billing_read_owner;
+
+GRANT SELECT (id, name)
+  ON gos_billing.plans TO gos_billing_read_owner;
+
+-- Existing billing tables use FORCE ROW LEVEL SECURITY.
+-- These SELECT-only policies apply solely to the
+-- dedicated, non-login SECURITY DEFINER function owner.
+--
+-- They do not grant access to gos_web_billing_read.
+-- The function must establish session/tenant authority
+-- in its own query, independently of custom GUCs.
+
+CREATE POLICY billing_api_owner_read
+  ON gos_billing.subscriptions
+  FOR SELECT
+  TO gos_billing_read_owner
+  USING (true);
+
+CREATE POLICY billing_api_owner_read
+  ON gos_billing.prices
+  FOR SELECT
+  TO gos_billing_read_owner
+  USING (true);
+
+CREATE POLICY billing_api_owner_read
+  ON gos_billing.plans
+  FOR SELECT
+  TO gos_billing_read_owner
+  USING (true);
+
+CREATE FUNCTION billing_api.read_current_subscription(
+  handle_hash text,
+  requested_mode text
+)
+RETURNS TABLE (
+  id uuid,
+  organization_id uuid,
+  organization_name text,
+  plan_name text,
+  price_id uuid,
+  mode text,
+  status text,
+  current_start timestamptz,
+  current_end timestamptz,
+  charge_at timestamptz,
+  paid_until timestamptz,
+  refund_blocked_until timestamptz,
+  cancel_at_period_end boolean,
+  cancel_state text,
+  create_state text,
+  last_synced_at timestamptz
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+  SELECT
+    sub.id,
+    org.id,
+    org.name,
+    plan.name,
+    sub.price_id,
+    sub.mode,
+    sub.status,
+    sub.current_start,
+    sub.current_end,
+    sub.charge_at,
+    sub.paid_until,
+    sub.refund_blocked_until,
+    sub.cancel_at_period_end,
+    sub.cancel_state,
+    sub.create_state,
+    sub.last_synced_at
+  FROM public.auth_sessions AS sess
+  JOIN public.users AS usr
+    ON usr.id = sess.user_id
+   AND usr.status = 'ACTIVE'
+  JOIN public.organizations AS org
+    ON org.id = sess.active_organization_id
+   AND org.status = 'ACTIVE'
+  JOIN public.memberships AS membership
+    ON membership.organization_id = org.id
+   AND membership.user_id = usr.id
+   AND membership.status = 'ACTIVE'
+   AND membership.accepted_at IS NOT NULL
+   AND membership.role IN ('CLIENT_OWNER', 'CLIENT_ADMIN')
+  JOIN gos_billing.subscriptions AS sub
+    ON sub.organization_id = org.id
+   AND sub.mode = read_current_subscription.requested_mode
+  JOIN gos_billing.prices AS price
+    ON price.id = sub.price_id
+   AND price.mode = sub.mode
+  JOIN gos_billing.plans AS plan
+    ON plan.id = price.plan_id
+  WHERE read_current_subscription.handle_hash ~ '^[0-9a-f]{64}$'
+    AND read_current_subscription.requested_mode IN ('test', 'live')
+    AND sess.session_handle_hash = read_current_subscription.handle_hash
+    AND sess.revoked_at IS NULL
+    AND sess.expires_at > statement_timestamp()
+  ORDER BY sub.created_at DESC, sub.id DESC
+  LIMIT 1;
+$function$;
+
+ALTER FUNCTION billing_api.read_current_subscription(text, text)
+  OWNER TO gos_billing_read_owner;
+
+REVOKE ALL ON FUNCTION
+  billing_api.read_current_subscription(text, text)
+  FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION
+  billing_api.read_current_subscription(text, text)
+  TO gos_web_billing_read;
+
+-- Deliberately no direct table grants to the web login.
+-- Deliberately no general-purpose SQL API.
+-- Deliberately no worker role membership.
+-- Deliberately no scope-setting authorization.
+-- Deliberately no modification of prior migrations.
+
+COMMIT;
+
+
+=== SHARED BILLING TYPES ===
+/** Only safe billing projections cross the browser boundary. Money is minor-unit text. */
+export type BillingMode = 'test' | 'live';
+export type SubscriptionStatus =
+  | 'creating'
+  | 'created'
+  | 'authenticated'
+  | 'active'
+  | 'pending'
+  | 'halted'
+  | 'paused'
+  | 'cancelled'
+  | 'completed'
+  | 'expired';
+export interface BillingPrice {
+  id: string;
+  code: string;
+  name: string;
+  amount_minor: string;
+  currency: 'INR';
+  mode: BillingMode;
+}
+export interface BillingSubscription {
+  id: string;
+  organization_id: string;
+  organization_name: string;
+  plan_name: string;
+  price_id: string;
+  mode: BillingMode;
+  status: SubscriptionStatus;
+  current_start: string | null;
+  current_end: string | null;
+  charge_at: string | null;
+  paid_until: string | null;
+  refund_blocked_until: string | null;
+  cancel_at_period_end: boolean;
+  cancel_state: 'none' | 'requested' | 'confirmed' | 'uncertain';
+  create_state: 'reserved' | 'confirmed' | 'uncertain';
+  last_synced_at: string | null;
+  access: {
+    allowed: boolean;
+    state: 'unpaid' | 'paid' | 'grace' | 'past_due' | 'refunded';
+    grace_until: string | null;
+  };
+}
+export interface BillingAccount {
+  organization: { id: string; name: string };
+  can_manage: boolean;
+  mode: BillingMode;
+  subscription: BillingSubscription | null;
+  grace_days: number;
+}
+export interface CheckoutSession {
+  local_subscription_id: string;
+  key_id: string;
+  subscription_id: string;
+  mode: BillingMode;
+}
+export type BillingHistoryKind = 'payments' | 'invoices' | 'refunds';
+export interface BillingHistoryRow {
+  id: string;
+  organization_id: string;
+  organization_name: string;
+  subscription_id: string;
+  provider_id: string;
+  status: string;
+  amount_minor: string;
+  currency: 'INR';
+  created_at: string;
+  refunded_minor?: string;
+  amount_due_minor?: string;
+  billing_end?: string | null;
+}
+export interface BillingPage<T> {
+  items: T[];
+  pagination: { limit: number; next_cursor: string | null; has_more: boolean };
+}
+export interface BillingSummary {
+  currency: 'INR';
+  captured_minor: string;
+  refunded_minor: string;
+  net_collections_minor: string;
+  failed_payments: number;
+  overdue_subscriptions: number;
+  active_subscriptions: number;
+  webhook_failures: number;
+  pending_webhooks: number;
+  mode: BillingMode;
+}
+export interface BillingAdminRow {
+  id: string;
+  created_at: string;
+  status?: string;
+  event_type?: string;
+  attempts?: number;
+  error_code?: string | null;
+  action?: string;
+  result?: string;
+  organization_id?: string | null;
+  actor_id?: string | null;
+  resource_id?: string;
+  request_id?: string;
+  price_id?: string;
+}
+

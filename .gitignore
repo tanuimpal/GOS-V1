@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+.env*
+!.env.example
+*.tsbuildinfo
+*.log
+*.zip
+upload/
+.codex/
+.library-save-result.json
+.foundation-save-result.json
+.verification/

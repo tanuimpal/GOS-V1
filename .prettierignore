@@ -1,0 +1,14 @@
+node_modules
+.next
+package-lock.json
+next-env.d.ts
+*.tsbuildinfo
+upload
+*.zip
+playwright-report
+test-results
+coverage
+.codex
+.library-save-result.json
+.foundation-save-result.json
+.verification

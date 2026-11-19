@@ -1,0 +1,267 @@
+﻿GOS V1 — Restricted Billing Integration Boundaries
+Step 158.94.9UQ
+READ-ONLY SOURCE SNAPSHOT
+
+--- backend\access\session.ts ---
+ 18: const verifiedSession: unique symbol = Symbol('verifiedBillingSession');
+ 19: export interface BillingIdentity {
+ 20:   readonly [verifiedSession]: true;
+ 21:   readonly principal: PrincipalContext;
+ 22:   readonly tenant: TenantContext | null;
+ 23:   readonly organizationName: string | null;
+ 24:   readonly sessionId: string;
+ 25:   readonly isPlatformAdmin: boolean;
+ 26: }
+ 27: export interface IdentityResolver {
+ 28:   resolve(request: Request, requestId: string): Promise<BillingIdentity>;
+ 29: }
+ 30: /** Cookie consumption only. An independently verified login adapter must issue sessions. */
+ 31: export function createIdentityResolver(
+ 32:   repository: SessionRepository,
+ 33:   mint: (
+ 34:     record: SessionRecord,
+ 35:     requestId: string,
+ 36:   ) => { principal: PrincipalContext; tenant: TenantContext | null },
+ 37: ): IdentityResolver {
+ 38:   return {
+ 39:     async resolve(request, requestId) {
+ 40:       const cookies = (request.headers.get('cookie') ?? '')
+ 41:         .split(';')
+ 42:         .map((part) => part.trim().split('='));
+ 43:       const matches = cookies.filter(([key]) => key === '__Host-gos_session');
+ 44:       if (matches.length !== 1 || matches[0].length !== 2 || !/^[0-9a-f]{64}$/.test(matches[0][1]))
+ 45:         throw new AuthenticationError();
+ 46:       const hash = createHash('sha256').update(matches[0][1]).digest('hex');
+ 47:       const record = await repository.findByHash(hash);
+ 48:       if (!record) throw new AuthenticationError();
+ 49:       return Object.freeze({
+ 50:         [verifiedSession]: true as const,
+ 51:         ...mint(record, requestId),
+ 52:         organizationName: record.organization_name,
+ 53:         sessionId: record.session_id,
+ 54:         isPlatformAdmin: record.platform_admin,
+ 55:       });
+ 56:     },
+ 57:   };
+ 58: }
+ 59: export function authorizeBilling(
+ 60:   identity: BillingIdentity,
+ 61:   scope: 'client' | 'master',
+ 62:   write = false,
+ 63: ): void {
+ 64:   if (identity[verifiedSession] !== true) throw new AuthenticationError();
+ 65:   if (scope === 'master') {
+ 66:     if (!identity.isPlatformAdmin) throw new AuthorizationError();
+ 67:     return;
+ 68:   }
+ 69:   const role = identity.tenant?.role;
+ 70:   if (!role || (write ? role !== 'CLIENT_OWNER' : !['CLIENT_OWNER', 'CLIENT_ADMIN'].includes(role)))
+ 71:     throw new AuthorizationError();
+ 72: }
+
+--- backend\domains\billing\service.ts ---
+140:     return {
+141:       items: rows,
+142:       pagination: {
+143:         limit,
+144:         has_more: hasMore,
+145:         next_cursor: hasMore ? nextBillingCursor(rows.at(-1)!.id, scope, config.keySecret) : null,
+146:       },
+147:     };
+148:   }
+149:   return {
+150:     plans: (identity: BillingIdentity) => repository.plans(identity),
+151:     async account(identity: BillingIdentity): Promise<BillingAccount> {
+152:       authorizeBilling(identity, 'client');
+153:       const sub = await repository.current(identity);
+154:       return {
+155:         organization: {
+156:           id: identity.tenant!.organizationId,
+157:           name: identity.organizationName ?? 'Your organization',
+158:         },
+159:         can_manage: identity.tenant!.role === 'CLIENT_OWNER',
+160:         mode: config.mode,
+161:         subscription: sub ? publicSubscription(sub, config.graceDays) : null,
+162:         grace_days: config.graceDays,
+163:       };
+164:     },
+165:     async create(
+166:       identity: BillingIdentity,
+167:       priceId: string,
+168:       key: string,
+169:     ): Promise<CheckoutSession> {
+170:       authorizeBilling(identity, 'client', true);
+
+--- database\billing.ts ---
+  1: import 'server-only';
+  2: import { Pool } from 'pg';
+  3: import { getServerEnvironment } from '@/backend/config/env';
+  4: import { AppError, DatabaseError, DatabaseNotConfiguredError } from '@/backend/errors';
+  5: import { getLogger } from '@/backend/logging/server-logger';
+  6: 
+  7: export interface SqlSession {
+  8:   query<T extends object = Record<string, unknown>>(
+  9:     text: string,
+ 10:     values?: unknown[],
+ 11:   ): Promise<{ rows: T[]; rowCount: number | null }>;
+ 12: }
+ 13: export interface BillingScope {
+ 14:   kind: 'tenant' | 'master' | 'system' | 'identity';
+ 15:   userId?: string;
+ 16:   organizationId?: string;
+ 17: }
+ 18: export interface BillingDatabase {
+ 19:   transaction<T>(scope: BillingScope, work: (sql: SqlSession) => Promise<T>): Promise<T>;
+ 20:   close(): Promise<void>;
+ 21: }
+ 22: /** A private parameterized SQL port; never exported through HTTP or client components. */
+ 23: export function createBillingDatabase(
+ 24:   pool: Pool,
+ 25:   domain: 'billing' | 'social' = 'billing',
+ 26: ): BillingDatabase {
+ 27:   return createScopedDatabase(pool, domain, false);
+ 28: }
+ 29: 
+ 30: /**
+ 31:  * Worker-only transaction transport. This must receive a separately configured pool;
+ 32:  * it verifies PostgreSQL's authenticated identity on every connection before any work.
+ 33:  * Dedicated worker roles and credentials depend on Migration 0004. Until then, no
+ 34:  * production factory should construct this adapter, so system operations fail closed.
+ 35:  */
+ 36: export function createWorkerBillingDatabase(
+ 37:   pool: Pool,
+ 38:   domain: 'billing' | 'social' = 'billing',
+ 39: ): BillingDatabase {
+ 40:   return createScopedDatabase(pool, domain, true);
+ 41: }
+ 42: 
+ 43: function createScopedDatabase(
+ 44:   pool: Pool,
+ 45:   domain: 'billing' | 'social',
+ 46:   worker: boolean,
+ 47: ): BillingDatabase {
+ 48:   return {
+ 49:     async transaction(scope, work) {
+ 50:       if (scope.kind === 'system' && !worker)
+ 51:         throw new AppError(
+ 52:           'DATABASE_SYSTEM_SCOPE_UNAVAILABLE',
+ 53:           503,
+ 54:           'System database operations require the authenticated worker database adapter.',
+ 55:         );
+ 56:       if (worker && scope.kind !== 'system')
+ 57:         throw new AppError(
+ 58:           'DATABASE_WORKER_SCOPE_INVALID',
+ 59:           403,
+ 60:           'The worker database adapter only accepts system operations.',
+ 61:         );
+ 62:       const client = await pool.connect().catch((error) => {
+ 63:         throw new DatabaseError({ cause: error });
+ 64:       });
+ 65:       try {
+ 66:         await client.query('BEGIN');
+ 67:         const { rows } = await client.query<{ safe: boolean }>(
+ 68:           `SELECT
+ 69:           current_user = session_user
+ 70:           AND NOT EXISTS (SELECT 1 FROM pg_roles r
+ 71:             WHERE r.rolname IN (current_user,session_user)
+ 72:               AND (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication))
+ 73:           AND NOT EXISTS (SELECT 1 FROM pg_roles granted
+ 74:             WHERE pg_has_role(session_user,granted.oid,'MEMBER')
+ 75:               AND (granted.rolsuper OR granted.rolbypassrls OR granted.rolcreaterole
+ 76:                 OR granted.rolcreatedb OR granted.rolreplication))
+ 77:           AND NOT EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname=$1
+ 78:             AND pg_has_role(session_user,n.nspowner,'MEMBER'))
+ 79:           AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ 80:             WHERE n.nspname=$1 AND pg_has_role(session_user,c.relowner,'MEMBER')) AS safe`,
+ 81:           ['gos_' + domain],
+ 82:         );
+ 83:         if (rows[0]?.safe !== true)
+ 84:           throw new AppError(
+ 85:             domain === 'billing' ? 'BILLING_DATABASE_ROLE_INVALID' : 'SOCIAL_DATABASE_ROLE_INVALID',
+ 86:             503,
+ 87:             'Database access is not configured safely.',
+ 88:           );
+ 89:         if (scope.kind === 'system') {
+ 90:           const expectedWorker = domain === 'billing' ? 'gos_billing_worker' : 'gos_social_worker';
+ 91:           const identity = await client.query<{ authenticated: boolean }>(
+ 92:             'SELECT current_user = $1 AS authenticated',
+ 93:             [expectedWorker],
+ 94:           );
+ 95:           if (identity.rows[0]?.authenticated !== true)
+ 96:             throw new AppError(
+ 97:               'DATABASE_WORKER_IDENTITY_INVALID',
+ 98:               503,
+ 99:               'System database operations require the authenticated worker database identity.',
+100:             );
+101:         }
+102:         await client.query(
+103:           "SELECT set_config($4,$1,true),set_config('gos.actor_id',$2,true),set_config('gos.organization_id',$3,true)",
+104:           [scope.kind, scope.userId ?? '', scope.organizationId ?? '', 'gos.' + domain + '_scope'],
+105:         );
+106:         const result = await work(client);
+107:         await client.query('COMMIT');
+108:         return result;
+109:       } catch (error) {
+110:         await client.query('ROLLBACK').catch(() => {});
+111:         if (error instanceof AppError) throw error;
+112:         throw new DatabaseError({ cause: error });
+113:       } finally {
+114:         client.release();
+115:       }
+116:     },
+117:     close: () => pool.end(),
+118:   };
+119: }
+120: let database: BillingDatabase | undefined;
+121: export function getBillingDatabase(): BillingDatabase {
+122:   if (database) return database;
+123:   const env = getServerEnvironment();
+124:   if (!env.databaseUrl) throw new DatabaseNotConfiguredError();
+125:   const pool = new Pool({
+126:     connectionString: env.databaseUrl,
+127:     ssl: env.databaseSsl === 'require' ? { rejectUnauthorized: true } : false,
+128:     max: 3,
+129:     connectionTimeoutMillis: 2000,
+130:     idleTimeoutMillis: 10000,
+131:     statement_timeout: 5000,
+132:     query_timeout: 6000,
+133:     application_name: 'gos-billing',
+134:     allowExitOnIdle: true,
+135:   });
+
+--- backend\app\billing.ts ---
+  1: import 'server-only';
+  2: import { getBillingDatabase } from '@/database/billing';
+  3: import { createBillingIdentityResolver } from '@/backend/access/context';
+  4: import { createSessionRepository } from '@/backend/access/session-repository';
+  5: import { BillingRepository } from '@/backend/domains/billing/repository';
+  6: import { createBillingService } from '@/backend/domains/billing/service';
+  7: import { createRazorpayProvider } from '@/backend/domains/billing/provider';
+  8: import { getBillingConfig } from '@/backend/domains/billing/config';
+  9: 
+ 10: // Authentication runs before billing configuration or provider calls; no cookie means 401.
+ 11: export const billingIdentityResolver = createBillingIdentityResolver({
+ 12:   findByHash: (hash) => createSessionRepository(getBillingDatabase()).findByHash(hash),
+ 13: });
+ 14: export function getBillingService() {
+ 15:   const config = getBillingConfig();
+ 16:   return createBillingService(
+ 17:     new BillingRepository(getBillingDatabase(), config.mode),
+ 18:     createRazorpayProvider(config),
+ 19:     config,
+ 20:   );
+ 21: }
+
+--- backend\config\env.ts ---
+  1: import 'server-only';
+  2: import { parseEnvironment, type ServerEnvironment } from './validation';
+  3: 
+  4: let environment: ServerEnvironment | undefined;
+  5: 
+  6: /** Read lazily at runtime. No secrets are required during a static build. */
+  7: export function getServerEnvironment(): ServerEnvironment {
+  8:   environment ??= parseEnvironment(process.env, {
+  9:     productionRuntime: process.env.NODE_ENV === 'production',
+ 10:   });
+ 11:   return environment;
+ 12: }
